@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fjssp-mcts-research"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+    "pydantic",
+    "numpy",
+    "pandas",
+    "PettingZoo",
+    "gymnasium",
+    "stable-baselines3[extra]",
+    "tensorboard",
+    "fastapi",
+    "uvicorn",
+    "python-dotenv",
+    "pillow",
+    "torch",
+    "ipykernel",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
