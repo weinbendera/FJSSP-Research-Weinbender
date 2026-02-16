@@ -1,5 +1,7 @@
 from factory.factory_schemas import Operation, Job, Action
-from factory.factory_logic_loader import FactoryLogic
+from utils.input_schemas import EnergySource
+from utils.factory_logic_loader import FactoryLogic
+from utils.job_builder import JobBuilder
 from factory.machine_runtime import MachineRuntime
 from factory.factory_state import FactoryState
 from typing import List, Dict, Optional, Tuple

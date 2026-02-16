@@ -3,6 +3,7 @@
 ## Project Context
 
 Read `.claude/docs/alphazero_implementation.md` for the full research plan and design decisions.
+Read `.claude/project_directory.md` for the full project directory and architecture.
 
 ## Overview
 
@@ -21,4 +22,8 @@ AlphaZero-based scheduler for Flexible Job Shop Scheduling Problems (FJSP) using
 
 ## File Structure
 
-- [briefly describe where key files live once your repo takes shape]
+- `FJSSP-MCTS-Research/data/` — Input data (textile factory JSON)
+- `FJSSP-MCTS-Research/utils/` — Shared: input schemas, factory logic loader, job builder
+- `FJSSP-MCTS-Research/factory/` — Factory simulation (OOP, used by greedy/GA/MARL)
+- `FJSSP-MCTS-Research/schedulers/` — All schedulers (greedy, rule-based, GA, MARL, OR, alphazero)
+- `FJSSP-MCTS-Research/schedulers/alphazero/` — AlphaZero GNN+MCTS scheduler (env, model, mcts, training)

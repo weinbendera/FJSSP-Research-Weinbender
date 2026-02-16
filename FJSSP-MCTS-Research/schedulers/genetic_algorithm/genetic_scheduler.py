@@ -21,7 +21,22 @@ The fitness is then used to select the best individuals for the next generation
 
 How is the Fitness calculated?
 
+The fitness of an individual (i.e. genome) is assessed by:
+1. Decoding the genome into a feasible schedule (using a priority dispatching heuristic).
+2. Calculating the energy cost of the resulting schedule:
+   - Sums the energy usage at each time step for every machine.
+   - Considers solar contribution and grid price for each time step if available.
+   - Energy drawn from solar power is "free" (zero cost); excess demand is purchased from the grid at the current price.
+3. Calculating the makespan: the latest end time across all operations.
+4. Applying penalties:
+   - If not all operations could be scheduled (infeasible), a major penalty is added.
+   - If any job deadlines are violated, a penalty term is added for each violation.
+5. Overall fitness is a weighted sum of total cost and makespan (plus any penalties).
+
+The lower the cost and makespan (and number of violations), the better the individual.
+The genetic algorithm uses this fitness function to evolve better genotypes over generations by selection, crossover, and mutation.
 """
+
 
 
 class Individual:

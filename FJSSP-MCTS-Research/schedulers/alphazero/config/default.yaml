@@ -1,0 +1,29 @@
+# AlphaZero FJSP Hyperparameters
+
+# --- Self-play ---
+num_iterations: 100
+games_per_iteration: 50
+
+# --- MCTS ---
+mcts_simulations: 100
+c_puct: 1.5
+dirichlet_alpha: 0.3
+dirichlet_epsilon: 0.25
+temperature_threshold: 0.3   # fraction of steps before temp drops
+temperature_high: 1.0
+temperature_low: 0.1
+
+# --- Training ---
+batch_size: 32
+batches_per_iteration: 10
+learning_rate: 0.001
+weight_decay: 0.0001
+replay_buffer_size: 100000
+
+# --- Model ---
+hidden_dim: 64
+num_gnn_layers: 3
+
+# --- Checkpointing ---
+checkpoint_interval: 10
+checkpoint_dir: "checkpoints"

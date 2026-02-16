@@ -2,9 +2,9 @@
 
 ## Project Overview
 
-This document serves as a technical reference for implementing an AlphaZero-based scheduler for a Flexible Job Shop Scheduling Problem (FJSP) using real textile manufacturing data. The goal is to minimize makespan using a GNN-based policy-value network guided by Monte Carlo Tree Search (MCTS).
+This document describes the implemented AlphaZero-based scheduler for a Flexible Job Shop Scheduling Problem (FJSP) using real textile manufacturing data. The goal is to minimize makespan using a GNN-based policy-value network guided by Monte Carlo Tree Search (MCTS).
 
-This is a stepping stone toward a future MuZero implementation. Get AlphaZero working end-to-end first.
+This is a stepping stone toward a future MuZero implementation.
 
 ---
 
@@ -16,1043 +16,428 @@ This is a stepping stone toward a future MuZero implementation. Get AlphaZero wo
 - **Machines**: 3 machines with flexible routing (operations can run on multiple eligible machines)
 - **Jobs**: Configurable set of jobs, each decomposed into ordered operations
 - **Precedence**: Few ordering constraints per job (some operations must precede others)
+- **Collision constraints**: Certain task types cannot run simultaneously across any machines
+- **Time leaps**: Day boundaries that operations cannot cross
 - **Objective**: Minimize makespan (total schedule completion time)
 - **Time discretization**: 5-minute steps; all operation durations are multiples of 5 minutes
 
 ### Key Terminology
 
-| Term                  | Definition                                                                       |
-| --------------------- | -------------------------------------------------------------------------------- |
-| Job                   | A complete unit of work (e.g., a textile order) composed of multiple operations  |
-| Operation             | An atomic task within a job with a fixed duration and a set of eligible machines |
-| Makespan              | Time from schedule start to completion of the last operation                     |
-| Eligible machines     | The subset of machines that can perform a given operation                        |
-| Precedence constraint | An ordering requirement: operation A must complete before operation B starts     |
+| Term | Definition |
+|------|------------|
+| Job | A complete unit of work (e.g., a textile order) composed of one or more operations |
+| Operation | An atomic task within a job with eligible machines and task modes |
+| Task mode | A specific way to perform an operation on a machine (determines duration and power) |
+| Action triple | A valid (operation, machine, task_mode) combination |
+| Makespan | Time from schedule start to completion of the last operation |
+| Eligible machines | The subset of machines that can perform a given operation |
+| Precedence constraint | An ordering requirement: operation A must complete before B starts |
+| Collision constraint | Two task types that cannot run simultaneously on any machines |
+| Time leap | Day boundary that operations cannot cross |
 
 ---
 
 ## 2. Architecture Overview
 
 ```
-┌─────────────────────────────────────────────────────┐
-│                   Training Loop                      │
-│                                                      │
-│   Self-Play ──► Replay Buffer ──► Network Training   │
-│       │                               │              │
-│       └───────────────────────────────┘              │
-└─────────────────────────────────────────────────────┘
+Training Loop:
+  Self-Play ──► Replay Buffer ──► Network Training ──► (repeat)
+      │                                │
+      └────────────────────────────────┘
 
-Self-Play Detail:
-┌──────────────────────────────────────────────────────┐
-│  For each 5-min step:                                │
-│    For each machine (sequential):                    │
-│      1. Build bipartite graph from current state     │
-│      2. GNN encodes graph → policy prior + value     │
-│      3. MCTS uses prior + value to search            │
-│      4. Select action from MCTS visit counts         │
-│      5. Update state (assign operation to machine)   │
-│    Advance environment by one 5-min step             │
-└──────────────────────────────────────────────────────┘
+Self-Play Detail (per episode):
+  env.reset()
+  while not done:
+    For each machine M0 → M1 → M2 (sequential):
+      1. If only 1 legal action → skip MCTS (forced move)
+      2. Otherwise:
+         a. Build HeteroData graph from current state
+         b. GNN encodes graph → policy prior + value estimate
+         c. MCTS uses prior + value to search (100 simulations)
+         d. Record (graph features, visit counts, legal mask) as training example
+         e. Select action from MCTS visit counts (temperature-based)
+      3. Apply action, update state
+    After all 3 machines decide → advance time by 1 step
+  Set all value targets retroactively to -makespan / makespan_ub
 ```
 
 ---
 
 ## 3. Environment Design
 
-### 3.1 Framework
+### 3.1 Config Compiler (`env/config_compiler.py`)
 
-- **Library**: Gymnasium (gym)
-- **Language**: Python + PyTorch
+Bridges between string-keyed domain objects (FactoryLogic, Job, Operation) and fast numpy arrays. All lookups become integer indexing.
 
-### 3.2 Sequential Decision Model
+**Key compiled arrays:**
+- `action_op`, `action_machine`, `action_task_mode`, `action_duration` — all valid (op, machine, task_mode) triples
+- `machine_action_mask` — (num_machines, num_actions) boolean for per-machine action filtering
+- `op_to_job`, `op_to_task` — maps operations to their job and task type
+- `op_predecessors` — ragged list of predecessor op indices per operation
+- `precedence_pairs` — (num_precedence, 2) array of (pred, succ) indices
+- `collision_pairs` — task type pairs that cannot run simultaneously
+- `time_leaps` — day boundary timesteps
+- `makespan_ub` — upper bound (sum of max duration per op) for value normalization
+- String ID lookups for converting back to Schedule output
 
-At each 5-minute timestep, machines are queried **sequentially** in a fixed order (Machine 0 → Machine 1 → Machine 2). Each machine either:
-
-- **Is busy** (mid-operation): No decision needed, automatically skip.
-- **Is idle**: Must choose from eligible operations or remain idle.
-
-Each sub-decision (one per idle machine) constitutes a separate MCTS search. The state updates between sub-decisions within the same timestep, so later machines see earlier machines' choices.
-
+**Usage:**
 ```python
-class FJSPEnv(gym.Env):
-    """
-    Flexible Job Shop Scheduling Environment
-
-    Observation: Bipartite graph (operation nodes <-> machine nodes)
-    Action: Index into the current machine's eligible operations (+ idle action)
-    Reward: Negative makespan at episode end (0 for intermediate steps)
-    """
-
-    def __init__(self, jobs_config, num_machines=3, step_duration=5):
-        super().__init__()
-        self.num_machines = num_machines
-        self.step_duration = step_duration  # minutes per timestep
-        self.jobs_config = jobs_config
-
-        # Track which machine is currently deciding
-        self.current_machine_idx = 0
-
-    def reset(self):
-        """
-        Initialize all jobs/operations. No operations assigned yet.
-        Returns: initial observation (bipartite graph), info dict
-        """
-        # Initialize job/operation data structures
-        # Set current_time = 0
-        # Set current_machine_idx = 0
-        # Return initial graph observation
-        pass
-
-    def step(self, action):
-        """
-        Assign the chosen operation to the current machine, or idle.
-
-        Args:
-            action: int - index into current machine's eligible operations
-                    (last index = idle/do nothing)
-
-        Returns:
-            observation: bipartite graph for NEXT machine's decision
-            reward: 0 for intermediate steps, -makespan at episode end
-            terminated: True when all operations are scheduled and complete
-            truncated: False (no truncation)
-            info: dict with debugging info
-        """
-        # 1. Apply action to current machine
-        # 2. Advance current_machine_idx
-        # 3. If all machines have decided this timestep:
-        #      - Advance time by step_duration
-        #      - Decrement remaining processing times
-        #      - Free machines whose operations completed
-        #      - Reset current_machine_idx = 0
-        #      - Skip to next machine that needs a decision
-        # 4. If no more decisions needed and all ops done: terminated = True
-        # 5. Build and return new observation
-        pass
-
-    def get_legal_actions(self):
-        """
-        Returns a binary mask over the action space for the current machine.
-        An operation is legal if:
-          - It has not been assigned/completed
-          - Its precedence constraints are satisfied
-          - The current machine is in its eligible machine set
-          - It is not currently assigned to another machine
-        The idle action is always legal.
-        """
-        pass
-
-    def get_state(self):
-        """
-        Returns a hashable/copyable state for MCTS tree nodes.
-        Must capture full environment state for perfect simulation.
-        """
-        pass
-
-    def set_state(self, state):
-        """
-        Restores environment to a previously captured state.
-        Required for MCTS backtracking.
-        """
-        pass
+factory_logic = FactoryLogicLoader.load_from_file(data_path)
+jobs = JobBuilder(factory_logic).build_jobs(product_requests)
+config = CompiledConfig.compile(factory_logic, jobs)
 ```
 
-### 3.3 State Representation (Internal)
+### 3.2 Sequential Decision Model (`env/fjsp_env.py`)
 
-The environment must track:
+Pure numpy environment — no Gymnasium dependency.
 
-```python
-@dataclass
-class EnvironmentState:
-    current_time: int                    # Current timestep (in 5-min increments)
-    current_machine_idx: int             # Which machine is currently deciding
+At each timestep, machines are queried **sequentially** in fixed order (M0 → M1 → M2). Each machine either:
+- **Is busy**: Only idle is legal (forced move, skipped by MCTS in self-play)
+- **Is idle**: Chooses from eligible (op, machine, task_mode) actions or idle
 
-    # Per-operation state
-    op_status: np.ndarray                # 0=unscheduled, 1=in_progress, 2=completed
-    op_remaining_time: np.ndarray        # Steps remaining for in-progress ops
-    op_assigned_machine: np.ndarray      # -1 if unassigned, else machine index
+After all 3 machines decide, `_advance_time()` runs: decrements remaining times, frees completed machines, checks terminal condition.
 
-    # Per-machine state
-    machine_status: np.ndarray           # 0=idle, 1=busy
-    machine_current_op: np.ndarray       # -1 if idle, else operation index
-    machine_remaining_steps: np.ndarray  # Steps until current op completes
+**Action space**: Integer index into the compiled action table (0 to num_actions-1 = action triples, num_actions = idle).
 
-    # Static data (does not change during episode)
-    op_durations: np.ndarray             # Duration of each op in steps (per machine)
-    op_eligible_machines: List[List[int]]# Which machines can do each operation
-    precedence_edges: List[Tuple[int,int]]  # (predecessor_op, successor_op)
-    op_to_job: np.ndarray                # Maps operation index to job index
-```
-
-### 3.4 Reward Design
+### 3.3 Mutable State (~2.5KB for 60 ops, 3 machines)
 
 ```python
-def compute_reward(self):
-    if self.is_terminal():
-        # Negative makespan so that minimizing makespan = maximizing reward
-        makespan = self.current_time  # or track actual completion time
-        return -makespan
-    return 0.0  # No intermediate reward
+class EnvState(NamedTuple):
+    op_status: np.ndarray           # (num_ops,) int8 — 0=unscheduled, 1=in_progress, 2=completed
+    op_remaining_time: np.ndarray   # (num_ops,) int16
+    op_assigned_machine: np.ndarray # (num_ops,) int8 — -1 if unassigned
+    op_assigned_task_mode: np.ndarray # (num_ops,) int16
+    op_start_step: np.ndarray       # (num_ops,) int16
+    op_duration: np.ndarray         # (num_ops,) int16
+    machine_busy: np.ndarray        # (num_machines,) bool
+    machine_current_op: np.ndarray  # (num_machines,) int16
+    machine_remaining: np.ndarray   # (num_machines,) int16
+    job_being_processed: np.ndarray # (num_jobs,) bool
+    current_time: int
+    current_machine_idx: int
+    done: bool
 ```
 
-> **Design note**: Sparse reward (only at episode end) is standard for AlphaZero since MCTS handles credit assignment through full-game simulation. Do not add shaping rewards — they bias the value function.
+`get_state()` / `set_state()` use numpy `.copy()` — no deepcopy. Called thousands of times per MCTS search.
 
-### 3.5 Episode Termination
+### 3.4 Legal Action Constraints
 
-An episode ends when **all operations** have status `completed`. This means:
+An action (op, machine, task_mode) is legal if:
+1. The action is for the **current machine**
+2. The operation is **unscheduled**
+3. All **predecessors** are completed
+4. The **job** is not currently being processed (one-op-per-job-at-a-time)
+5. No **collision conflict** with currently running task types
+6. The operation won't cross a **time leap** boundary
+7. **Deadline** not already passed (if applicable)
 
-- Every operation has been assigned to a machine
-- Every operation has finished processing (remaining_time reached 0)
+Idle is always legal.
+
+### 3.5 Reward Design
+
+- Intermediate steps: reward = 0
+- Terminal: reward = -makespan (raw negative makespan)
+- Value targets for training are normalized: `-makespan / makespan_ub` (maps to roughly [-1, 0])
 
 ---
 
-## 4. Graph Neural Network (GNN)
+## 4. Graph Neural Network
 
-### 4.1 Bipartite Graph Structure
+### 4.1 Graph Structure (`env/graph_builder.py`)
 
-The state is represented as a **heterogeneous bipartite graph** with two node types and one edge type:
+Heterogeneous graph (PyG `HeteroData`) with:
 
-```
-Node Types:
-  - Operation nodes (one per operation in the problem)
-  - Machine nodes (one per machine, i.e., 3 nodes)
+**Node types:**
+- `"op"`: One per operation (10 features)
+- `"machine"`: One per machine (6 features)
 
-Edge Type:
-  - "eligible": connects operation i to machine j if machine j can process operation i
-  - Edges are UNDIRECTED (message passing flows both ways)
+**Edge types:**
+- `("op", "eligible", "machine")`: Dynamic — unscheduled ops to their eligible machines. Shrinks as ops complete.
+- `("op", "precedes", "op")`: Static — precedence constraints between operations.
 
-Dynamic behavior:
-  - Edges are REMOVED when an operation is assigned/completed
-    (it no longer needs to be scheduled)
-  - Node features UPDATE every step to reflect current state
-```
+**Global features:** Stored as `data.global_features` (5 dims for 3 machines).
 
 ### 4.2 Node Features
 
-#### Operation Node Features
+**Operation features (10 dims):**
+| Index | Feature | Description |
+|-------|---------|-------------|
+| 0-2 | status one-hot | unscheduled / in_progress / completed |
+| 3 | duration_norm | mean duration of eligible task modes / max_duration |
+| 4 | remaining_time_norm | remaining steps / max_duration |
+| 5 | job_progress | fraction of job's ops completed |
+| 6 | precedence_depth_norm | max chain length from root / max_depth |
+| 7 | num_eligible_norm | number of eligible machines / max_eligible |
+| 8 | is_ready | 1 if all predecessors completed and unscheduled |
+| 9 | is_schedulable | 1 if ready AND job not currently being processed |
 
-```python
-operation_features = {
-    "status":              # one-hot [unscheduled, in_progress, completed] → 3 dims
-    "duration_normalized": # processing time / max_processing_time → 1 dim
-    "remaining_time_norm": # remaining steps / duration (0 if not started) → 1 dim
-    "job_progress":        # fraction of job's operations completed → 1 dim
-    "precedence_depth":    # max chain length from this op to job end → 1 dim
-    "num_eligible":        # number of eligible machines (normalized) → 1 dim
-    "is_ready":            # 1 if all predecessors completed, 0 otherwise → 1 dim
-    "is_schedulable":      # 1 if ready AND unscheduled → 1 dim
-}
-# Total: ~10 dimensions per operation node
-```
+**Machine features (6 dims):**
+| Index | Feature | Description |
+|-------|---------|-------------|
+| 0-1 | status one-hot | idle / busy |
+| 2 | remaining_time_norm | steps until free / max_duration |
+| 3 | utilization | fraction of elapsed time spent busy |
+| 4 | queue_load | schedulable ops for this machine / num_ops |
+| 5 | is_current | 1 if this is the machine currently deciding |
 
-#### Machine Node Features
+**Global features (2 + num_machines dims):**
+| Index | Feature | Description |
+|-------|---------|-------------|
+| 0 | time_norm | current_time / max_time |
+| 1 | overall_progress | fraction of all ops completed |
+| 2-4 | current_machine one-hot | which machine is deciding |
 
-```python
-machine_features = {
-    "status":              # one-hot [idle, busy] → 2 dims
-    "remaining_time_norm": # steps until free / max_op_duration → 1 dim
-    "utilization":         # fraction of elapsed time spent busy → 1 dim
-    "queue_load":          # number of eligible unscheduled ops (normalized) → 1 dim
-    "is_current":          # 1 if this is the machine currently deciding → 1 dim
-}
-# Total: ~6 dimensions per machine node
-```
-
-#### Global Features (appended after pooling or as a separate context)
-
-```python
-global_features = {
-    "time_normalized":     # current_time / estimated_max_time → 1 dim
-    "overall_progress":    # fraction of all operations completed → 1 dim
-    "current_machine_idx": # one-hot encoding of deciding machine → 3 dims
-}
-# Total: ~5 dimensions
-```
-
-### 4.3 GNN Architecture
-
-Use PyTorch Geometric (PyG) for the heterogeneous GNN.
+### 4.3 GNN Architecture (`model/gnn.py`)
 
 ```
-Input: HeteroData graph with operation & machine nodes + eligible edges
+Input Features
     │
     ▼
-Heterogeneous Message Passing (2-3 layers)
-    │  Each layer:
-    │    op → machine: aggregate info from eligible operations
-    │    machine → op: aggregate info from eligible machines
-    │    + residual connections + LayerNorm
+Input Projection (Linear + ReLU per node type)
     │
     ▼
-Node Embeddings: op_embeddings (N_ops × D), machine_embeddings (3 × D)
+3x HeteroConv layers:
+    SAGEConv: op → machine (via "eligible" edges)
+    SAGEConv: machine → op (via "rev_eligible" edges, flipped)
+    SAGEConv: op → op (via "precedes" edges)
+    + Residual connections + LayerNorm per node type
     │
-    ▼
-Global Pooling: mean(all node embeddings) + global_features → context vector
+    ├─────────────────────────────────────┐
+    ▼                                     ▼
+Policy Head                          Value Head
+    │                                     │
+For each action triple:              mean(op_emb) + mean(machine_emb)
+  concat [op_emb, machine_emb,       + global_features
+          task_mode_features]             │
+    → MLP → scalar logit             MLP → tanh → scalar [-1, 1]
     │
-    ├──────────────────────┐
-    ▼                      ▼
-Policy Head            Value Head
++ learnable idle embedding → idle logit
+    │
+Apply legal mask (-inf for illegal)
+    → softmax → probability distribution
 ```
 
-```python
-import torch
-import torch.nn as nn
-from torch_geometric.nn import HeteroConv, SAGEConv, global_mean_pool
-
-class FJSPNet(nn.Module):
-    """
-    GNN-based policy-value network for FJSP AlphaZero.
-    """
-    def __init__(self, op_feature_dim, machine_feature_dim, global_feature_dim,
-                 hidden_dim=128, num_gnn_layers=3):
-        super().__init__()
-
-        # Input projections
-        self.op_encoder = nn.Linear(op_feature_dim, hidden_dim)
-        self.machine_encoder = nn.Linear(machine_feature_dim, hidden_dim)
-
-        # Heterogeneous GNN layers
-        self.gnn_layers = nn.ModuleList()
-        self.layer_norms = nn.ModuleList()
-        for _ in range(num_gnn_layers):
-            conv = HeteroConv({
-                ('operation', 'eligible', 'machine'): SAGEConv(hidden_dim, hidden_dim),
-                ('machine', 'rev_eligible', 'operation'): SAGEConv(hidden_dim, hidden_dim),
-            }, aggr='mean')
-            self.gnn_layers.append(conv)
-            self.layer_norms.append(nn.ModuleDict({
-                'operation': nn.LayerNorm(hidden_dim),
-                'machine': nn.LayerNorm(hidden_dim),
-            }))
-
-        # Policy head: scores eligible operations for the current machine
-        # Input: concatenation of [op_embedding, current_machine_embedding]
-        self.policy_head = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 1)  # scalar score per operation
-        )
-
-        # Idle action embedding (learnable)
-        self.idle_embedding = nn.Parameter(torch.randn(hidden_dim))
-
-        # Value head: predicts schedule quality from global state
-        self.value_head = nn.Sequential(
-            nn.Linear(hidden_dim + global_feature_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 1),
-            nn.Tanh()  # normalized value in [-1, 1]
-        )
-
-    def forward(self, hetero_data, current_machine_idx, legal_action_mask):
-        """
-        Args:
-            hetero_data: PyG HeteroData with operation and machine nodes
-            current_machine_idx: int, which machine is deciding
-            legal_action_mask: boolean tensor, True for legal actions
-
-        Returns:
-            policy: probability distribution over legal actions (including idle)
-            value: scalar state value estimate
-        """
-        # 1. Encode input features
-        x_dict = {
-            'operation': self.op_encoder(hetero_data['operation'].x),
-            'machine': self.machine_encoder(hetero_data['machine'].x),
-        }
-
-        # 2. GNN message passing with residual connections
-        for conv, norms in zip(self.gnn_layers, self.layer_norms):
-            x_update = conv(x_dict, hetero_data.edge_index_dict)
-            for node_type in x_dict:
-                x_dict[node_type] = norms[node_type](
-                    x_dict[node_type] + x_update[node_type]
-                )
-
-        # 3. Policy: score each eligible operation for the current machine
-        current_machine_emb = x_dict['machine'][current_machine_idx]  # (D,)
-        op_embeddings = x_dict['operation']  # (N_ops, D)
-
-        # Concatenate each op embedding with current machine embedding
-        machine_expanded = current_machine_emb.unsqueeze(0).expand(op_embeddings.size(0), -1)
-        policy_input = torch.cat([op_embeddings, machine_expanded], dim=-1)  # (N_ops, 2D)
-        op_scores = self.policy_head(policy_input).squeeze(-1)  # (N_ops,)
-
-        # Add idle action score
-        idle_input = torch.cat([self.idle_embedding, current_machine_emb])
-        idle_score = self.policy_head(idle_input.unsqueeze(0)).squeeze()
-        all_scores = torch.cat([op_scores, idle_score.unsqueeze(0)])  # (N_ops + 1,)
-
-        # Apply legal action mask and softmax
-        all_scores[~legal_action_mask] = float('-inf')
-        policy = torch.softmax(all_scores, dim=0)
-
-        # 4. Value: global pooling + value head
-        all_embeddings = torch.cat([x_dict['operation'], x_dict['machine']], dim=0)
-        global_emb = all_embeddings.mean(dim=0)
-        global_input = torch.cat([global_emb, hetero_data.global_features])
-        value = self.value_head(global_input)
-
-        return policy, value
-```
-
-### 4.4 Key Implementation Notes for GNN
-
-- **Use `torch_geometric`** (PyG) for heterogeneous graph support
-- **Install**: `pip install torch-geometric`
-- **SAGEConv** is a good starting point; can upgrade to GATConv (attention) later
-- **Residual connections + LayerNorm** are critical for training stability with 3+ layers
-- **The graph structure changes each step** — rebuild `HeteroData` from environment state each time
-- **Batch graphs** across MCTS simulations for GPU efficiency during self-play
+**Key details:**
+- Hidden dim: 64 (configurable)
+- Policy scores ALL action triples (not just current machine's), then legal mask zeros out irrelevant ones
+- Task mode features: [duration_normalized, total_power_normalized] (2 dims, precomputed as buffer)
+- Action → op/machine/task_mode index mappings stored as registered buffers for efficient GPU lookup
+- Aggregation: `"sum"` in HeteroConv
 
 ---
 
-## 5. Monte Carlo Tree Search (MCTS)
+## 5. Monte Carlo Tree Search (`mcts/mcts.py`)
 
-### 5.1 AlphaZero MCTS Overview
+### 5.1 Key Design: Lazy Expansion
 
-MCTS in AlphaZero uses the neural network to **guide search** rather than random rollouts. At each node:
+Child nodes are created **on-demand** during selection, not all at once during expansion. This avoids creating 50+ unused child states per node.
 
-1. **Select**: Traverse tree using PUCT formula until reaching a leaf
-2. **Expand**: Use the neural network to get policy prior and value estimate for the leaf
-3. **Backpropagate**: Update visit counts and value estimates up the tree
+On expand: store the policy priors and legal mask on the parent node. Child `Node` objects are created only when first selected via PUCT.
 
-There are **no rollouts** — the value network replaces them.
+Child state is computed lazily: when a child is first visited, `env.set_state(parent.state)` → `env.step(action)` → `node.state = env.get_state()`.
 
-### 5.2 PUCT Selection Formula
-
-```
-PUCT(s, a) = Q(s, a) + c_puct * P(s, a) * sqrt(N(s)) / (1 + N(s, a))
-
-Where:
-  Q(s, a)     = mean value of action a from state s (average of backed-up values)
-  P(s, a)     = prior probability from the policy network
-  N(s)        = total visit count of state s
-  N(s, a)     = visit count of action a from state s
-  c_puct      = exploration constant (start with 1.5, tune later)
-```
-
-### 5.3 MCTS Implementation
+### 5.2 MCTS Configuration
 
 ```python
-class MCTSNode:
-    def __init__(self, state, parent=None, action=None, prior=0.0):
-        self.state = state           # Environment state (copyable)
-        self.parent = parent
-        self.action = action         # Action that led to this node
-        self.prior = prior           # P(s, a) from policy network
-
-        self.children = {}           # action -> MCTSNode
-        self.visit_count = 0         # N(s, a)
-        self.value_sum = 0.0         # Total backed-up value
-        self.is_expanded = False
-
-    @property
-    def q_value(self):
-        if self.visit_count == 0:
-            return 0.0
-        return self.value_sum / self.visit_count
-
-
-class MCTS:
-    def __init__(self, network, env, num_simulations=100, c_puct=1.5):
-        self.network = network
-        self.env = env
-        self.num_simulations = num_simulations
-        self.c_puct = c_puct
-
-    def search(self, root_state):
-        """
-        Run MCTS from the given state. Returns action probabilities
-        based on visit counts.
-        """
-        root = MCTSNode(state=root_state)
-        self._expand(root)
-
-        for _ in range(self.num_simulations):
-            node = root
-            search_path = [node]
-
-            # SELECT: traverse tree using PUCT
-            while node.is_expanded and node.children:
-                action, node = self._select_child(node)
-                search_path.append(node)
-
-            # EXPAND + EVALUATE
-            value = self._expand(node)
-
-            # BACKPROPAGATE
-            self._backpropagate(search_path, value)
-
-        # Return visit count distribution as action probabilities
-        return self._get_action_probs(root)
-
-    def _select_child(self, node):
-        """Select child with highest PUCT score."""
-        best_score = -float('inf')
-        best_action = None
-        best_child = None
-
-        for action, child in node.children.items():
-            puct_score = (
-                child.q_value +
-                self.c_puct * child.prior *
-                math.sqrt(node.visit_count) / (1 + child.visit_count)
-            )
-            if puct_score > best_score:
-                best_score = puct_score
-                best_action = action
-                best_child = child
-
-        return best_action, best_child
-
-    def _expand(self, node):
-        """
-        Expand a leaf node:
-        1. Set environment to node's state
-        2. Get legal actions
-        3. Run GNN to get policy prior and value
-        4. Create child nodes for each legal action
-        """
-        self.env.set_state(node.state)
-
-        if self.env.is_terminal():
-            # Terminal node: return actual normalized reward
-            return self._normalize_value(self.env.get_makespan())
-
-        legal_mask = self.env.get_legal_actions()
-        graph = self.env.build_graph()  # Build PyG HeteroData
-        current_machine = self.env.current_machine_idx
-
-        with torch.no_grad():
-            policy, value = self.network(graph, current_machine, legal_mask)
-
-        # Create children for each legal action
-        legal_actions = torch.where(legal_mask)[0]
-        for action in legal_actions:
-            action_idx = action.item()
-            child_env = self.env.copy()
-            child_env.set_state(node.state)
-            child_env.step(action_idx)
-
-            child = MCTSNode(
-                state=child_env.get_state(),
-                parent=node,
-                action=action_idx,
-                prior=policy[action_idx].item()
-            )
-            node.children[action_idx] = child
-
-        node.is_expanded = True
-        return value.item()
-
-    def _backpropagate(self, search_path, value):
-        """Update visit counts and values up the search path."""
-        for node in reversed(search_path):
-            node.visit_count += 1
-            node.value_sum += value
-            # No sign flip — this is single-agent, not adversarial
-
-    def _get_action_probs(self, root, temperature=1.0):
-        """
-        Convert visit counts to action probabilities.
-        temperature=1.0 for exploration, temperature→0 for exploitation.
-        """
-        actions = list(root.children.keys())
-        visits = np.array([root.children[a].visit_count for a in actions])
-
-        if temperature == 0:
-            # Deterministic: pick most-visited
-            probs = np.zeros_like(visits, dtype=np.float32)
-            probs[np.argmax(visits)] = 1.0
-        else:
-            visits_temp = visits ** (1.0 / temperature)
-            probs = visits_temp / visits_temp.sum()
-
-        return dict(zip(actions, probs))
-
-    def _normalize_value(self, makespan):
-        """
-        Normalize makespan to [-1, 1] range for the value head.
-        Use running min/max or fixed bounds from problem analysis.
-        """
-        # Option 1: Fixed normalization based on problem bounds
-        min_possible = self.env.get_lower_bound()  # e.g., critical path length
-        max_possible = self.env.get_upper_bound()   # e.g., sum of all durations
-        # Normalized so that better (shorter) makespan → higher value
-        return -2.0 * (makespan - min_possible) / (max_possible - min_possible) + 1.0
+@dataclass
+class MCTSConfig:
+    num_simulations: int = 100
+    c_puct: float = 1.5
+    dirichlet_alpha: float = 0.3
+    dirichlet_epsilon: float = 0.25
+    temperature_threshold: float = 0.3  # fraction of steps before temp drops
+    temperature_high: float = 1.0
+    temperature_low: float = 0.1
 ```
 
-### 5.4 Critical MCTS Design Decisions
+### 5.3 Search Loop
 
-| Decision                | Choice                                | Rationale                                                   |
-| ----------------------- | ------------------------------------- | ----------------------------------------------------------- |
-| Rollout policy          | None (value network only)             | Standard AlphaZero; no random rollouts                      |
-| Number of simulations   | Start with 100-200                    | 3 machines × few ops = small branching factor              |
-| c_puct                  | 1.5                                   | Standard starting point; tune based on exploration behavior |
-| Temperature             | 1.0 for first 30% of steps, 0.1 after | Explore early, exploit late in each episode                 |
-| Dirichlet noise at root | α=0.3, ε=0.25                       | Standard AlphaZero exploration noise                        |
-| Value normalization     | Map makespan to [-1, 1]               | Required for Tanh value head                                |
-
-### 5.5 State Copy Performance
-
-MCTS requires copying and restoring environment states thousands of times per move. This **must be fast**.
-
-```python
-import copy
-
-class FJSPEnv:
-    def get_state(self):
-        """Return a lightweight, copyable state snapshot."""
-        return EnvironmentState(
-            current_time=self.current_time,
-            current_machine_idx=self.current_machine_idx,
-            op_status=self.op_status.copy(),
-            op_remaining_time=self.op_remaining_time.copy(),
-            op_assigned_machine=self.op_assigned_machine.copy(),
-            machine_status=self.machine_status.copy(),
-            machine_current_op=self.machine_current_op.copy(),
-            machine_remaining_steps=self.machine_remaining_steps.copy(),
-            # Static data: reference only (don't copy)
-            op_durations=self.op_durations,
-            op_eligible_machines=self.op_eligible_machines,
-            precedence_edges=self.precedence_edges,
-            op_to_job=self.op_to_job,
-        )
-
-    def set_state(self, state):
-        """Restore from snapshot. Only copy dynamic arrays."""
-        self.current_time = state.current_time
-        self.current_machine_idx = state.current_machine_idx
-        self.op_status = state.op_status.copy()
-        self.op_remaining_time = state.op_remaining_time.copy()
-        self.op_assigned_machine = state.op_assigned_machine.copy()
-        self.machine_status = state.machine_status.copy()
-        self.machine_current_op = state.machine_current_op.copy()
-        self.machine_remaining_steps = state.machine_remaining_steps.copy()
+```
+For each simulation:
+  1. Start at root, set env to root state
+  2. SELECT: traverse expanded nodes using PUCT until reaching unexpanded or terminal
+     - PUCT(a) = Q(a) + c_puct * P(a) * sqrt(N_parent) / (1 + N_child)
+     - Q values normalized to [0,1] using running min/max
+     - Lazy child creation: create Node on first visit
+     - Lazy state computation: apply action from parent state on first visit
+  3. EXPAND: run GNN on leaf state → get priors and value
+  4. BACKPROPAGATE: update visit_count and value_sum up to root
 ```
 
-> **Performance tip**: Profile `get_state`/`set_state` early. With 100+ MCTS simulations per move and 3 machines per step, you'll call these thousands of times per episode. Use numpy array copies, not deepcopy.
+**Dirichlet noise** added at root only: `(1-eps) * prior + eps * noise` over legal actions, then renormalized.
+
+**Terminal values** normalized: `reward / makespan_ub` (maps raw -makespan to roughly [-1, 0]).
+
+**Action selection** from visit counts uses temperature-based sampling (high temp early, low temp late in episode).
 
 ---
 
-## 6. Training Loop
+## 6. Training Pipeline
 
-### 6.1 Self-Play Data Generation
+### 6.1 Self-Play (`training/self_play.py`)
+
+Each episode generates training examples:
 
 ```python
-def self_play_episode(env, network, mcts_config):
-    """
-    Play one full episode using MCTS to generate training data.
-
-    Returns:
-        training_examples: list of (graph, policy_target, value_target)
-    """
-    training_examples = []
-    state = env.reset()
-    mcts = MCTS(network, env, **mcts_config)
-    step_count = 0
-
-    while not env.is_terminal():
-        # Determine temperature
-        temperature = 1.0 if step_count < total_steps * 0.3 else 0.1
-
-        # Run MCTS from current state
-        current_state = env.get_state()
-        action_probs = mcts.search(current_state)
-
-        # Store training example (graph, policy target, placeholder value)
-        graph = env.build_graph()
-        legal_mask = env.get_legal_actions()
-        machine_idx = env.current_machine_idx
-
-        # Convert action_probs dict to full-size policy vector
-        policy_target = np.zeros(env.action_space_size)
-        for action, prob in action_probs.items():
-            policy_target[action] = prob
-
-        training_examples.append({
-            'graph': graph,
-            'machine_idx': machine_idx,
-            'legal_mask': legal_mask,
-            'policy_target': policy_target,
-            'value_target': None  # filled in after episode
-        })
-
-        # Sample action from MCTS probabilities
-        actions = list(action_probs.keys())
-        probs = list(action_probs.values())
-        action = np.random.choice(actions, p=probs)
-
-        env.step(action)
-        step_count += 1
-
-        # Add Dirichlet noise at root for next search
-        # (handled inside MCTS.search)
-
-    # Fill in value targets: all positions get the final outcome
-    final_value = mcts._normalize_value(env.get_makespan())
-    for example in training_examples:
-        example['value_target'] = final_value
-
-    return training_examples
+def play_episode(env, graph_builder, model, mcts_config, device) -> List[TrainingExample]:
+    # 1. Reset env
+    # 2. For each decision point:
+    #    - Skip MCTS if only 1 legal action (forced move optimization)
+    #    - Run MCTS search → get visit counts
+    #    - Restore env state (MCTS mutates it internally)
+    #    - Store (graph_features, visit_count_policy, legal_mask) as numpy
+    #    - Sample action from visit counts, apply to env
+    # 3. Set all value_targets retroactively to -makespan / makespan_ub
 ```
 
-### 6.2 Network Training
+**TrainingExample** stores numpy arrays (not PyG objects) for compact storage:
+- `op_features`, `machine_features`, `global_features`
+- Sparse edges: `eligible_edge_src/dst`, `precedes_edge_index`
+- `policy_target` (normalized visit counts), `value_target`, `legal_mask`
+
+### 6.2 Replay Buffer (`training/replay_buffer.py`)
+
+- Fixed-size circular buffer of `TrainingExample` objects
+- `sample(batch_size)` returns random batch
+- `examples_to_batch()` reconstructs PyG `HeteroData` from stored numpy arrays during training
+
+### 6.3 Trainer (`training/trainer.py`)
+
+- Loss = cross_entropy(policy) + MSE(value)
+- Optimizer: Adam with weight decay
+- Processes examples individually (heterogeneous graphs with different sizes can't easily batch in PyG)
+- Accumulates gradients over the batch, then steps once
 
 ```python
-def train_network(network, optimizer, replay_buffer, batch_size=256, epochs=10):
-    """
-    Train the policy-value network on self-play data.
-    """
-    for epoch in range(epochs):
-        batch = replay_buffer.sample(batch_size)
+# Policy loss: cross-entropy with MCTS visit distribution
+log_policy = torch.log(policy.clamp(min=1e-8))
+policy_loss = -torch.sum(policy_target * log_policy)
 
-        # Forward pass
-        policies, values = [], []
-        for example in batch:
-            policy, value = network(
-                example['graph'],
-                example['machine_idx'],
-                example['legal_mask']
-            )
-            policies.append(policy)
-            values.append(value)
+# Value loss: MSE between predicted value and normalized -makespan
+value_loss = F.mse_loss(value, value_target)
 
-        policies = torch.stack(policies)
-        values = torch.stack(values).squeeze()
-
-        # Targets
-        policy_targets = torch.stack([ex['policy_target'] for ex in batch])
-        value_targets = torch.tensor([ex['value_target'] for ex in batch])
-
-        # Loss = cross-entropy(policy) + MSE(value)
-        policy_loss = -torch.sum(policy_targets * torch.log(policies + 1e-8), dim=1).mean()
-        value_loss = nn.functional.mse_loss(values, value_targets)
-        total_loss = policy_loss + value_loss
-
-        optimizer.zero_grad()
-        total_loss.backward()
-        optimizer.step()
-
-    return policy_loss.item(), value_loss.item()
+total_loss = policy_loss + value_loss
 ```
 
-### 6.3 Full Training Pipeline
+### 6.4 Pipeline (`training/pipeline.py`)
 
+Orchestrates: self-play → replay buffer → training → repeat.
+
+**Key features:**
+- Serial self-play (single device) or parallel via persistent worker pool
+- Persistent worker pool: workers spawned once via `mp.Process(spawn)`, receive `(model_state_dict, num_games)` via queues
+- Dead worker detection with fallback to serial
+- Checkpoint saving/loading (model + optimizer + history)
+- tqdm progress bars
+
+**PipelineConfig:**
 ```python
-def train_alphazero(env_config, num_iterations=100, games_per_iteration=50,
-                    num_simulations=100, batch_size=256):
-    """
-    Main AlphaZero training loop.
-    """
-    env = FJSPEnv(**env_config)
-    network = FJSPNet(
-        op_feature_dim=10,
-        machine_feature_dim=6,
-        global_feature_dim=5,
-        hidden_dim=128,
-        num_gnn_layers=3
-    )
-    optimizer = torch.optim.Adam(network.parameters(), lr=1e-3, weight_decay=1e-4)
-    replay_buffer = ReplayBuffer(max_size=100_000)
-
-    for iteration in range(num_iterations):
-        # 1. Self-play: generate training data
-        network.eval()
-        for game in range(games_per_iteration):
-            examples = self_play_episode(env, network, {
-                'num_simulations': num_simulations,
-                'c_puct': 1.5
-            })
-            replay_buffer.extend(examples)
-
-        # 2. Train network on collected data
-        network.train()
-        policy_loss, value_loss = train_network(
-            network, optimizer, replay_buffer, batch_size
-        )
-
-        # 3. Evaluate (optional: compare against previous best)
-        if iteration % 10 == 0:
-            makespan = evaluate(env, network, num_games=20)
-            print(f"Iter {iteration}: makespan={makespan:.1f}, "
-                  f"policy_loss={policy_loss:.4f}, value_loss={value_loss:.4f}")
-
-        # 4. Learning rate schedule (optional)
-        if iteration in [50, 80]:
-            for pg in optimizer.param_groups:
-                pg['lr'] *= 0.1
-```
-
-### 6.4 Replay Buffer
-
-```python
-class ReplayBuffer:
-    def __init__(self, max_size=100_000):
-        self.buffer = deque(maxlen=max_size)
-
-    def extend(self, examples):
-        self.buffer.extend(examples)
-
-    def sample(self, batch_size):
-        return random.sample(list(self.buffer), min(batch_size, len(self.buffer)))
-
-    def __len__(self):
-        return len(self.buffer)
+@dataclass
+class PipelineConfig:
+    num_iterations: int = 100       # outer training loop
+    games_per_iteration: int = 50   # self-play episodes per iteration
+    num_workers: int = 1            # parallel self-play workers
+    mcts_simulations: int = 100     # MCTS sims per decision point
+    c_puct: float = 1.5
+    dirichlet_alpha: float = 0.3
+    dirichlet_epsilon: float = 0.25
+    batch_size: int = 32
+    batches_per_iteration: int = 10
+    learning_rate: float = 1e-3
+    weight_decay: float = 1e-4
+    replay_buffer_size: int = 100_000
+    hidden_dim: int = 64
+    num_gnn_layers: int = 3
+    checkpoint_interval: int = 10
+    checkpoint_dir: str = "checkpoints"
 ```
 
 ---
 
-## 7. Hyperparameters
+## 7. AlphaZero Scheduler (`alphazero_scheduler.py`)
 
-### Recommended Starting Configuration
+Wraps the trained model as an `OnlineScheduler` for integration with the existing Factory simulation loop.
 
-```yaml
-# Environment
-num_machines: 3
-step_duration: 5  # minutes
+**Two modes:**
+- **MCTS mode**: Full MCTS search per decision (slower, better quality)
+- **Policy mode**: Just the policy network argmax (fast inference)
 
-# GNN
-hidden_dim: 128
-num_gnn_layers: 3
-gnn_type: SAGEConv  # upgrade to GATConv later if needed
-
-# MCTS
-num_simulations: 100       # increase to 200-400 if compute allows
-c_puct: 1.5
-dirichlet_alpha: 0.3       # noise parameter
-dirichlet_epsilon: 0.25    # fraction of noise mixed into prior
-temperature_threshold: 0.3 # fraction of episode steps before switching to low temp
-temperature_high: 1.0
-temperature_low: 0.1
-
-# Training
-learning_rate: 1e-3
-weight_decay: 1e-4
-batch_size: 256
-games_per_iteration: 50    # self-play games before training
-training_epochs: 10        # passes over sampled data per iteration
-replay_buffer_size: 100000
-num_iterations: 100        # outer loop iterations
-
-# Loss weights
-policy_loss_weight: 1.0
-value_loss_weight: 1.0
-```
+**Standalone evaluation** via `schedule()` method — runs the full schedule using the internal numpy env, bypassing the Factory class entirely.
 
 ---
 
-## 8. Build Order & Milestones
-
-Follow this order strictly. Each milestone should be tested independently before moving on.
-
-### Phase 1: Environment (Week 1)
-
-- [ ] Define job/operation data structures from textile data
-- [ ] Implement `FJSPEnv` with reset, step, is_terminal
-- [ ] Implement sequential machine decision logic
-- [ ] Implement `get_legal_actions` with precedence checking
-- [ ] Implement `get_state` / `set_state` (fast copy)
-- [ ] **Test**: Run environment with random actions, verify:
-  - All operations get scheduled and completed
-  - Precedence constraints are never violated
-  - Makespan calculation is correct
-  - `get_state`/`set_state` round-trips perfectly
-
-### Phase 2: Graph Construction (Week 1-2)
-
-- [ ] Implement `build_graph()` that converts env state to PyG HeteroData
-- [ ] Define operation node features (10 dims)
-- [ ] Define machine node features (6 dims)
-- [ ] Define global features (5 dims)
-- [ ] Build edge_index for eligible edges
-- [ ] **Test**: Visualize graphs at different timesteps, verify features make sense
-
-### Phase 3: GNN + Policy/Value Heads (Week 2)
-
-- [ ] Implement `FJSPNet` with heterogeneous message passing
-- [ ] Implement policy head with legal action masking
-- [ ] Implement value head
-- [ ] **Test**: Forward pass with random graph data, verify output shapes
-- [ ] **Test**: Policy sums to 1.0, only legal actions have nonzero probability
-
-### Phase 4: MCTS (Week 2-3)
-
-- [ ] Implement MCTSNode and MCTS search
-- [ ] Implement PUCT selection
-- [ ] Implement expansion with neural network evaluation
-- [ ] Implement backpropagation
-- [ ] Implement temperature-based action selection
-- [ ] Add Dirichlet noise at root
-- [ ] **Test**: Run MCTS with random network, verify:
-  - Visit counts accumulate correctly
-  - Higher-prior actions get more visits initially
-  - Action probabilities are valid distributions
-  - Search produces deterministic results with fixed seed
-
-### Phase 5: Self-Play + Training (Week 3-4)
-
-- [ ] Implement self-play episode generation
-- [ ] Implement replay buffer
-- [ ] Implement training loop with policy + value loss
-- [ ] Wire up full pipeline: self-play → buffer → train → repeat
-- [ ] **Test**: Verify loss decreases over iterations
-- [ ] **Test**: Compare learned policy against random baseline
-
-### Phase 6: Evaluation & Baselines (Week 4+)
-
-- [ ] Implement dispatching rule baselines (SPT, LPT, FIFO, random)
-- [ ] Track makespan over training iterations
-- [ ] Visualize Gantt charts of produced schedules
-- [ ] Profile and optimize bottlenecks (likely state copy and GNN forward pass)
-
----
-
-## 9. Multi-GPU Training Notes
-
-With 8-14 GPUs available on the school supercomputer:
-
-**Self-play parallelism** is the easiest win. Each GPU runs independent self-play games, feeding examples into a shared replay buffer.
+## 8. File Structure (Actual)
 
 ```
-GPU 0:     Network Training (main)
-GPU 1-7:   Self-play workers (each generates games independently)
-
-Flow:
-  1. Broadcast current network weights to all workers
-  2. Workers generate self-play games in parallel
-  3. Collect all examples into shared replay buffer
-  4. Train on GPU 0
-  5. Repeat
-```
-
-Use `torch.distributed` or `torch.multiprocessing` for this. Ray is also a clean option for managing workers.
-
----
-
-## 10. Common Pitfalls & Debugging
-
-| Issue                         | Symptom                                       | Fix                                                                                               |
-| ----------------------------- | --------------------------------------------- | ------------------------------------------------------------------------------------------------- |
-| Value head not learning       | Value loss stays flat                         | Check normalization range matches Tanh output; verify terminal rewards are correct                |
-| Policy ignores priors         | MCTS visit counts don't correlate with priors | Check c_puct isn't too low; verify prior probabilities are valid                                  |
-| Illegal actions selected      | Environment crashes                           | Verify legal_mask is correct; ensure mask is applied BEFORE softmax                               |
-| Slow MCTS                     | Training is bottlenecked on search            | Profile get_state/set_state; batch GNN forward passes; reduce num_simulations initially           |
-| Schedule never completes      | Episode runs forever                          | Check idle action logic; ensure time always advances; add max_steps safety limit                  |
-| Precedence violated           | Invalid schedules produced                    | Unit test precedence checking independently; verify it's checked in get_legal_actions             |
-| GNN outputs NaN               | Training crashes                              | Add gradient clipping; check for log(0) in policy loss; verify LayerNorm placement                |
-| All actions equal probability | Policy not learning                           | Check that policy targets from MCTS are not uniform; verify loss gradients flow through correctly |
-
----
-
-## 11. File Structure
-
-```
-alphazero_fjsp/
-├── README.md
-├── requirements.txt
-├── config/
-│   ├── default.yaml           # Hyperparameters
-│   └── textile_jobs.yaml      # Job/operation definitions from textile data
+FJSSP-MCTS-Research/schedulers/alphazero/
+├── __init__.py
+├── alphazero_scheduler.py           # OnlineScheduler wrapper (MCTS or policy-only)
 ├── env/
 │   ├── __init__.py
-│   ├── fjsp_env.py            # FJSPEnv gymnasium environment
-│   ├── state.py               # EnvironmentState dataclass
-│   └── graph_builder.py       # Converts env state to PyG HeteroData
+│   ├── config_compiler.py           # FactoryLogic + Jobs → numpy lookup tables
+│   ├── fjsp_env.py                  # Fast numpy env with get_state/set_state
+│   └── graph_builder.py             # Env state → PyG HeteroData
 ├── model/
 │   ├── __init__.py
-│   ├── gnn.py                 # FJSPNet (GNN + policy/value heads)
-│   └── utils.py               # Network utilities
+│   └── gnn.py                       # FJSPNet: HeteroConv GNN + policy/value heads
 ├── mcts/
 │   ├── __init__.py
-│   └── mcts.py                # MCTS implementation
+│   └── mcts.py                      # MCTS with PUCT, lazy expansion, value normalization
 ├── training/
 │   ├── __init__.py
-│   ├── self_play.py           # Self-play episode generation
-│   ├── trainer.py             # Network training loop
-│   ├── replay_buffer.py       # Experience replay
-│   └── pipeline.py            # Full AlphaZero training pipeline
-├── evaluation/
-│   ├── __init__.py
-│   ├── baselines.py           # Dispatching rule baselines (SPT, LPT, etc.)
-│   ├── evaluate.py            # Evaluation harness
-│   └── visualization.py       # Gantt chart plotting
-├── scripts/
-│   ├── train.py               # Entry point for training
-│   └── evaluate.py            # Entry point for evaluation
-└── tests/
-    ├── test_env.py            # Environment unit tests
-    ├── test_graph.py          # Graph construction tests
-    ├── test_mcts.py           # MCTS correctness tests
-    └── test_network.py        # Network shape/output tests
+│   ├── self_play.py                 # Episode generation with forced-move skip
+│   ├── replay_buffer.py             # Circular buffer, numpy storage, PyG reconstruction
+│   ├── trainer.py                   # Policy + value loss, Adam optimizer
+│   └── pipeline.py                  # Full orchestration with optional parallel workers
+├── train_alphazero.ipynb            # Training notebook (supercomputer)
+├── test_alphazero.ipynb             # Validation notebook
+└── alphazero_visualizations.ipynb   # Graph and MCTS visualizations
 ```
 
 ---
 
-## 12. Dependencies
+## 9. Training Metrics & Interpretation
+
+| Metric | Meaning | Healthy range |
+|--------|---------|---------------|
+| policy_loss | Cross-entropy between MCTS visits and network prior | ~4.0 = random, ~2.0 = learning, <1.0 = strong |
+| value_loss | MSE between predicted and actual normalized makespan | Should decrease; 0.05-0.1 is good |
+| mean_reward | Average -makespan/makespan_ub across games | [-1, 0]; closer to 0 = better |
+| num_examples | Training examples generated (non-forced decision points) | Varies per episode; increases as model improves |
+
+**Note on num_examples variability:** With the forced-move skip, the number of MCTS decision points per episode depends on the model's scheduling decisions. A random model keeps machines busy (many forced idles), while a trained model may create more states with multiple legal actions, increasing decision points and training time.
+
+---
+
+## 10. Common Issues Encountered
+
+| Issue | Symptom | Fix |
+|-------|---------|-----|
+| Value loss explosion (~1M) | Raw -makespan (~-1002) vs tanh [-1,1] | Normalize: -makespan / makespan_ub |
+| Training very slow | MCTS called on every decision point | Skip MCTS when only 1 legal action (forced move) |
+| MCTS not improving reward | 20 simulations spread over 50+ actions | Need 100+ simulations for meaningful signal |
+| Workers hanging (multiprocessing) | Spawned processes lack sys.path | Pass project_root, add try/except in worker loop |
+| UTF-8 encoding error on Windows | `GORGORÃO` misread as `GORGORÃƒO` | Add `encoding='utf-8'` to `open()` calls |
+| Iterations getting slower | More MCTS decision points as model improves | Reduce mcts_simulations or games_per_iteration |
+| Cached modules after file update | Old code runs despite file changes | `importlib.reload()` or kernel restart |
+
+---
+
+## 11. Dependencies
 
 ```
-# requirements.txt
 torch>=2.0
 torch-geometric>=2.4
-gymnasium>=0.29
 numpy>=1.24
-pyyaml>=6.0
-matplotlib>=3.7        # Gantt charts
+matplotlib>=3.7
 tqdm>=4.65
-tensorboard>=2.14      # Training logging (optional)
+networkx  # for visualizations
 ```
 
 ---
 
-## 13. Key References
+## 12. Key References
 
 - Silver et al., "Mastering Chess and Shogi by Self-Play with a General Reinforcement Learning Algorithm" (AlphaZero, 2017)
 - Song et al., "Flexible Job-Shop Scheduling via Graph Neural Network and Deep Reinforcement Learning" (2022)
 - Park et al., "Learning to Schedule Job-Shop Problems: Representation and Policy Learning Using Graph Neural Network and Reinforcement Learning" (2021)
-- Scholl et al., "A Survey on Neural Combinatorial Optimization" (2022)
-
----
-
-## Appendix A: Quick Sanity Checks
-
-Run these before any training to catch bugs early:
-
-```python
-# 1. Environment determinism
-env = FJSPEnv(config)
-env.reset(seed=42)
-state1 = env.get_state()
-env.step(0)
-env.set_state(state1)
-env.step(0)
-state2 = env.get_state()
-assert states_equal(state1_after_step, state2)  # Must be identical
-
-# 2. Legal actions correctness
-env.reset()
-while not env.is_terminal():
-    legal = env.get_legal_actions()
-    assert legal.any(), "No legal actions but not terminal!"
-    action = np.random.choice(np.where(legal)[0])
-    env.step(action)
-
-# 3. Graph construction shapes
-graph = env.build_graph()
-assert graph['operation'].x.shape[1] == OP_FEATURE_DIM
-assert graph['machine'].x.shape[1] == MACHINE_FEATURE_DIM
-assert graph['operation', 'eligible', 'machine'].edge_index.shape[0] == 2
-
-# 4. Network output validity
-policy, value = network(graph, machine_idx=0, legal_mask=legal)
-assert torch.allclose(policy.sum(), torch.tensor(1.0), atol=1e-5)
-assert -1 <= value <= 1
-assert (policy[~legal] == 0).all()
-
-# 5. MCTS produces valid distributions
-action_probs = mcts.search(env.get_state())
-assert abs(sum(action_probs.values()) - 1.0) < 1e-5
-for action in action_probs:
-    assert legal[action], f"MCTS selected illegal action {action}"
-```
